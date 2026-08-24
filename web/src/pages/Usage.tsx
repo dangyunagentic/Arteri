@@ -8,6 +8,7 @@ import { fmt } from "./Overview";
 interface UsageData {
   daily: { day: string; requests: number; tokens: number; reasoning: number }[];
   perModel: { model: string; requests: number; tokens: number }[];
+  perProvider?: { provider_slug: string; requests: number; tokens: number }[];
   errors: number;
   days: number;
 }
@@ -106,6 +107,15 @@ export default function UsagePage() {
             {usage && usage.errors > 0 && <Badge tone="warn">{fmt(usage.errors)} errors</Badge>}
           </h2>
           <ul className="max-h-[480px] space-y-3 overflow-y-auto p-4">
+            {(usage?.perProvider ?? []).length > 1 && (
+              <li className="flex flex-wrap gap-1.5 pb-1">
+                {(usage?.perProvider ?? []).map((p) => (
+                  <Badge key={p.provider_slug} tone="neutral">
+                    {p.provider_slug || "custom"} · {fmt(p.tokens)}
+                  </Badge>
+                ))}
+              </li>
+            )}
             {(usage?.perModel ?? []).map((m) => {
               const max = usage?.perModel[0]?.tokens || 1;
               return (

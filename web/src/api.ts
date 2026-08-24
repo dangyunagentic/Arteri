@@ -1,6 +1,10 @@
 import { Outlet, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 
+export interface ApiError {
+  error?: { code?: string; message?: string };
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,

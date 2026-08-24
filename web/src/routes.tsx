@@ -5,9 +5,11 @@ import Login from "./pages/Login";
 import Console from "./Console";
 import Overview from "./pages/Overview";
 import Providers from "./pages/Providers";
-import Models from "./pages/Models";
+import CombosPage from "./pages/Combos";
 import Keys from "./pages/Keys";
 import UsagePage from "./pages/Usage";
+import QuotaPage from "./pages/Quota";
+import { SettingsPage } from "./pages/Settings";
 import Share from "./pages/Share";
 
 export const indexRoute = createRoute({
@@ -46,10 +48,10 @@ export const providersR = createRoute({
   path: "providers",
   component: Providers,
 });
-export const modelsR = createRoute({
+export const combosR = createRoute({
   getParentRoute: () => consoleRoute,
-  path: "models",
-  component: Models,
+  path: "combos",
+  component: CombosPage,
 });
 export const keysR = createRoute({
   getParentRoute: () => consoleRoute,
@@ -61,10 +63,20 @@ export const usageR = createRoute({
   path: "usage",
   component: UsagePage,
 });
+export const quotaR = createRoute({
+  getParentRoute: () => consoleRoute,
+  path: "quota",
+  component: QuotaPage,
+});
+export const settingsR = createRoute({
+  getParentRoute: () => consoleRoute,
+  path: "settings",
+  component: SettingsPage,
+});
 
 export const routeTree = rootRoute.addChildren([
   indexRoute,
   loginRoute,
   shareRoute,
-  consoleRoute.addChildren([consoleIndex, providersR, modelsR, keysR, usageR]),
+  consoleRoute.addChildren([consoleIndex, providersR, combosR, keysR, usageR, quotaR, settingsR]),
 ]);

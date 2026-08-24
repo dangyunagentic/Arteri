@@ -1,233 +1,404 @@
-// Providers — CRUD upstreams (base_url + api_key + protocol). Keys are write-only.
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+// Providers — 9Router-style catalog grid + per-connection model grid.
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { api } from "../api";
-import { Badge, Button, ErrorText, Field, Modal, Select, TextInput } from "../ui";
+import { api, type ApiError } from "../api";
+import { Badge, Button, ErrorText, Modal, TextInput } from "../ui";
 
-interface Provider {
+interface CatalogRow {
+  id: string;
+  name: string;
+  protocol: string;
+  category: "key" | "free" | "cloud";
+  website: string | null;
+  notice: string | null;
+  has_models_fetch: boolean;
+  connected_count: number;
+}
+interface ProviderRow {
   id: number;
   slug: string;
   name: string;
+  catalog: string;
   base_url: string;
-  protocol: "openai" | "anthropic";
-  extra_headers: string;
-  model_count: number;
+  protocol: string;
   has_key: boolean;
-  created_at: number;
+  model_count: number;
+}
+interface CachedModel {
+  upstream_id: string;
+  display_name: string;
+  enabled: boolean;
 }
 
-const PRESETS = [
-  { name: "OpenAI", base_url: "https://api.openai.com/v1", protocol: "openai" },
-  { name: "Anthropic", base_url: "https://api.anthropic.com", protocol: "anthropic" },
-  { name: "OpenRouter", base_url: "https://openrouter.ai/api/v1", protocol: "openai" },
-  { name: "Groq", base_url: "https://api.groq.com/openai/v1", protocol: "openai" },
-  { name: "DeepSeek", base_url: "https://api.deepseek.com/v1", protocol: "openai" },
-  { name: "Gemini (OpenAI-compat)", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", protocol: "openai" },
-  { name: "Ollama", base_url: "http://localhost:11434/v1", protocol: "openai" },
-];
+const CATEGORY_LABEL: Record<string, string> = {
+  key: "API key",
+  free: "Free tier",
+  cloud: "Cloud",
+};
 
-export default function Providers() {
+export function ProvidersPage() {
   const qc = useQueryClient();
-  const { data: providers } = useQuery({
+  const catalog = useQuery({
+    queryKey: ["catalog"],
+    queryFn: () => api<CatalogRow[]>("/api/admin/catalog"),
+    refetchInterval: 15_000,
+  });
+  const providers = useQuery({
     queryKey: ["providers"],
-    queryFn: () => api<Provider[]>("/api/admin/providers"),
+    queryFn: () => api<ProviderRow[]>("/api/admin/providers"),
+    refetchInterval: 15_000,
   });
-  const [editing, setEditing] = useState<Provider | "new" | null>(null);
-  const [err, setErr] = useState<string>();
 
-  const del = useMutation({
-    mutationFn: (id: number) => api(`/api/admin/providers/${id}`, { method: "DELETE" }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["providers"] }),
-  });
+  const [connectFor, setConnectFor] = useState<CatalogRow | null>(null);
+  const [customOpen, setCustomOpen] = useState(false);
+  const [openConn, setOpenConn] = useState<ProviderRow | null>(null);
 
   return (
-    <>
-      <header className="mb-5 flex items-center gap-3">
-        <h1 className="text-lg font-semibold tracking-tight">Providers</h1>
-        <span className="text-sm text-[var(--muted)]">upstreams with custom base URL + API key</span>
-        <Button variant="primary" className="ml-auto" onClick={() => { setErr(undefined); setEditing("new"); }}>
-          Add provider
+    <div className="space-y-6">
+      <header className="flex items-center justify-between gap-3">
+        <div>
+          <h1 className="text-lg font-semibold tracking-tight">Providers</h1>
+          <p className="text-sm text-[var(--muted)]">
+            Connect an upstream once, then enable the models you want exposed. Multiple connections per provider rotate round-robin.
+          </p>
+        </div>
+        <Button variant="secondary" onClick={() => setCustomOpen(true)}>
+          Custom provider
         </Button>
       </header>
 
-      <div className="overflow-x-auto rounded-lg border border-[var(--panel-edge)] bg-[var(--panel)]">
-        <table className="w-full text-left text-sm">
-          <thead>
-            <tr className="border-b border-[var(--panel-edge)] text-xs uppercase tracking-wider text-[var(--muted)]">
-              <th className="px-4 py-2.5 font-medium">Provider</th>
-              <th className="px-3 py-2.5 font-medium">Base URL</th>
-              <th className="px-3 py-2.5 font-medium">Protocol</th>
-              <th className="px-3 py-2.5 font-medium">Key</th>
-              <th className="px-3 py-2.5 font-medium">Models</th>
-              <th className="px-4 py-2.5 text-right font-medium">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(providers ?? []).map((p) => (
-              <tr key={p.id} className="border-t border-[var(--panel-edge)] first:border-t-0">
-                <td className="px-4 py-2.5">
-                  <div className="font-medium">{p.name}</div>
-                  <div className="mono text-[11px] text-[var(--faint)]">{p.slug}</div>
-                </td>
-                <td className="mono max-w-[280px] truncate px-3 py-2.5 text-[12px] text-[var(--muted)]">
-                  {p.base_url}
-                </td>
-                <td className="px-3 py-2.5">
-                  <Badge tone={p.protocol === "anthropic" ? "warn" : "accent"}>{p.protocol}</Badge>
-                </td>
-                <td className="px-3 py-2.5">
-                  {p.has_key ? <Badge tone="ok">set</Badge> : <Badge>none</Badge>}
-                </td>
-                <td className="mono px-3 py-2.5 text-[12px]">{p.model_count}</td>
-                <td className="px-4 py-2.5 text-right">
-                  <Button
-                    variant="ghost"
-                    className="px-2 py-1 text-xs"
-                    onClick={() => { setErr(undefined); setEditing(p); }}
-                  >
-                    Edit
-                  </Button>
-                  <Button
-                    variant="danger"
-                    className="ml-1.5 px-2 py-1 text-xs"
-                    onClick={() => {
-                      if (confirm(`Delete provider '${p.name}'? Its models are removed too.`))
-                        del.mutate(p.id);
-                    }}
-                  >
-                    Delete
-                  </Button>
-                </td>
-              </tr>
-            ))}
-            {providers && providers.length === 0 && (
-              <tr>
-                <td colSpan={6} className="px-4 py-10 text-center text-sm text-[var(--faint)]">
-                  no providers yet — add one to start routing
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
-
-      {editing && (
-        <ProviderModal
-          provider={editing === "new" ? null : editing}
-          onClose={() => setEditing(null)}
-          onError={setErr}
-        />
-      )}
-      <ErrorText>{err}</ErrorText>
-    </>
-  );
-}
-
-function ProviderModal({
-  provider,
-  onClose,
-  onError,
-}: {
-  provider: Provider | null;
-  onClose: () => void;
-  onError: (s?: string) => void;
-}) {
-  const qc = useQueryClient();
-  const [name, setName] = useState(provider?.name ?? "");
-  const [baseUrl, setBaseUrl] = useState(provider?.base_url ?? "");
-  const [apiKey, setApiKey] = useState("");
-  const [protocol, setProtocol] = useState(provider?.protocol ?? "openai");
-  const [extra, setExtra] = useState(
-    provider && provider.extra_headers !== "{}" ? provider.extra_headers : ""
-  );
-
-  const save = useMutation({
-    mutationFn: async () => {
-      const body: Record<string, unknown> = {
-        name,
-        base_url: baseUrl,
-        protocol,
-        extra_headers: extra.trim() ? JSON.parse(extra) : {},
-      };
-      if (apiKey.trim()) body.api_key = apiKey.trim();
-      if (!provider) body.api_key = apiKey.trim();
-      const url = provider ? `/api/admin/providers/${provider.id}` : "/api/admin/providers";
-      return api(url, { method: provider ? "PATCH" : "POST", body: JSON.stringify(body) });
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["providers"] });
-      onClose();
-    },
-    onError: (e: any) => onError(e.message),
-  });
-
-  return (
-    <Modal open onClose={onClose} title={provider ? `Edit ${provider.name}` : "Add provider"}>
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          save.mutate();
-        }}
-        className="space-y-3"
-      >
-        {!provider && (
-          <div className="flex flex-wrap gap-1.5">
-            {PRESETS.map((p) => (
-              <button
-                key={p.name}
-                type="button"
-                onClick={() => {
-                  setName(p.name);
-                  setBaseUrl(p.base_url);
-                  setProtocol(p.protocol as any);
-                }}
-                className="mono rounded-full border border-[var(--panel-edge)] px-2.5 py-1 text-[11px] text-[var(--muted)] transition-colors hover:border-[var(--accent)] hover:text-[var(--ink)]"
+      {/* catalog grid */}
+      <section>
+        <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--faint)]">Catalog</h2>
+        {catalog.isLoading ? (
+          <div className="skeleton h-40 rounded-[var(--radius)]" />
+        ) : (
+          <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-4">
+            {(catalog.data ?? []).map((e) => (
+              <div
+                key={e.id}
+                className="flex flex-col justify-between gap-2 rounded-[var(--radius)] border border-[var(--panel-edge)] bg-[var(--panel)] p-3"
               >
-                {p.name}
-              </button>
+                <div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-sm font-medium">{e.name}</span>
+                    <Badge tone={e.connected_count > 0 ? "ok" : "muted"}>
+                      {e.connected_count > 0 ? `${e.connected_count} connected` : "no connection"}
+                    </Badge>
+                  </div>
+                  <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-[var(--faint)]">
+                    <span>{CATEGORY_LABEL[e.category] ?? e.category}</span>
+                    <span>·</span>
+                    <span>{e.protocol}</span>
+                    {e.website && (
+                      <>
+                        <span>·</span>
+                        <a href={e.website} target="_blank" rel="noreferrer" className="link">
+                          get key
+                        </a>
+                      </>
+                    )}
+                  </div>
+                  {e.notice && <p className="mt-1 line-clamp-2 text-[11px] leading-snug text-[var(--muted)]">{e.notice}</p>}
+                </div>
+                <Button onClick={() => setConnectFor(e)}>+ Connect</Button>
+              </div>
             ))}
           </div>
         )}
-        <Field label="Name">
-          <TextInput required value={name} onChange={(e) => setName(e.target.value)} placeholder="My provider" />
+      </section>
+
+      {/* connections */}
+      <section>
+        <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--faint)]">Your connections</h2>
+        {providers.data && providers.data.length === 0 ? (
+          <p className="rounded-[var(--radius)] border border-dashed border-[var(--panel-edge)] p-6 text-center text-sm text-[var(--muted)]">
+            No connections yet — connect a provider above.
+          </p>
+        ) : (
+          <div className="overflow-hidden rounded-[var(--radius)] border border-[var(--panel-edge)]">
+            <table className="w-full text-sm">
+              <thead className="bg-[var(--inset)] text-left text-xs uppercase tracking-wide text-[var(--faint)]">
+                <tr>
+                  <th className="px-3 py-2 font-medium">Connection</th>
+                  <th className="px-3 py-2 font-medium">Slug</th>
+                  <th className="px-3 py-2 font-medium">Key</th>
+                  <th className="px-3 py-2 font-medium">Models</th>
+                  <th className="px-3 py-2 font-medium text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(providers.data ?? []).map((p) => (
+                  <tr key={p.id} className="border-t border-[var(--panel-edge)]">
+                    <td className="px-3 py-2">{p.name}</td>
+                    <td className="mono px-3 py-2 text-xs text-[var(--muted)]">{p.slug}</td>
+                    <td className="px-3 py-2">
+                      <Badge tone={p.has_key ? "ok" : "warn"}>{p.has_key ? "set" : "missing"}</Badge>
+                    </td>
+                    <td className="px-3 py-2 tabular-nums">{p.model_count}</td>
+                    <td className="px-3 py-2 text-right">
+                      <button className="link mr-3" onClick={() => setOpenConn(p)}>
+                        Models
+                      </button>
+                      <DeleteConnection id={p.id} onDone={() => qc.invalidateQueries({ queryKey: ["providers"] })} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      {connectFor && (
+        <ConnectModal
+          entry={connectFor}
+          onClose={() => setConnectFor(null)}
+          onSaved={() => {
+            setConnectFor(null);
+            qc.invalidateQueries({ queryKey: ["providers"] });
+            qc.invalidateQueries({ queryKey: ["catalog"] });
+          }}
+        />
+      )}
+      {customOpen && (
+        <CustomModal
+          onClose={() => setCustomOpen(false)}
+          onSaved={() => {
+            setCustomOpen(false);
+            qc.invalidateQueries({ queryKey: ["providers"] });
+          }}
+        />
+      )}
+      {openConn && <ModelsDrawer conn={openConn} onClose={() => setOpenConn(null)} />}
+    </div>
+  );
+}
+
+function ConnectModal({ entry, onClose, onSaved }: { entry: CatalogRow; onClose: () => void; onSaved: () => void }) {
+  const [key, setKey] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  const connect = useMutation({
+    mutationFn: async () => {
+      const r = await fetch("/api/admin/providers/connect", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(document.cookie.includes("arteri_admin") ? {} : {}) },
+        body: JSON.stringify({ catalog: entry.id, api_key: key }),
+      });
+      if (!r.ok) throw new Error(((await r.json()) as ApiError).error?.message ?? `HTTP ${r.status}`);
+      return r.json();
+    },
+    onSuccess: onSaved,
+    onError: (e) => setErr((e as Error).message),
+  });
+  return (
+    <Modal title={`Connect ${entry.name}`} onClose={onClose}>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          connect.mutate();
+        }}
+        className="space-y-3"
+      >
+        <Field label="API key" hint={entry.notice ?? undefined}>
+          <TextInput value={key} onChange={(e) => setKey(e.target.value)} placeholder={entry.protocol === "anthropic" ? "sk-ant-..." : "sk-..."} autoFocus />
         </Field>
-        <Field label="Base URL" hint="OpenAI-compatible: …/v1 · Anthropic: origin only">
-          <TextInput
-            required
-            type="url"
-            value={baseUrl}
-            onChange={(e) => setBaseUrl(e.target.value)}
-            placeholder="https://api.example.com/v1"
-          />
-        </Field>
-        <Field label="API key" hint={provider ? "leave empty to keep current" : undefined}>
-          <TextInput
-            required={!provider}
-            type="password"
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            placeholder={provider && provider.has_key ? "•••• stored" : "sk-…"}
-          />
-        </Field>
-        <Field label="Protocol">
-          <Select value={protocol} onChange={(e) => setProtocol(e.target.value as any)}>
-            <option value="openai">OpenAI chat completions</option>
-            <option value="anthropic">Anthropic messages</option>
-          </Select>
-        </Field>
-        <Field label="Extra headers" hint='optional JSON, e.g. {"HTTP-Referer":"https://x.dev"}'>
-          <TextInput value={extra} onChange={(e) => setExtra(e.target.value)} placeholder='{"X-Title":"arteri"}' />
-        </Field>
-        <ErrorText>{save.error ? (save.error as Error).message : undefined}</ErrorText>
+        <ErrorText msg={err} />
         <div className="flex justify-end gap-2 pt-1">
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" variant="primary" disabled={save.isPending}>
-            {provider ? "Save changes" : "Add provider"}
+          <Button type="submit" disabled={connect.isPending}>
+            {connect.isPending ? "Connecting..." : "Connect"}
           </Button>
         </div>
       </form>
     </Modal>
   );
+}
+
+function CustomModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
+  const [name, setName] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [protocol, setProtocol] = useState("openai");
+  const [err, setErr] = useState<string | null>(null);
+  const create = useMutation({
+    mutationFn: async () => {
+      const r = await fetch("/api/admin/providers/connect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ catalog: "custom", name, base_url: baseUrl, api_key: apiKey, protocol }),
+      });
+      if (!r.ok) throw new Error(((await r.json()) as ApiError).error?.message ?? `HTTP ${r.status}`);
+      return r.json();
+    },
+    onSuccess: onSaved,
+    onError: (e) => setErr((e as Error).message),
+  });
+  return (
+    <Modal title="Custom provider" onClose={onClose}>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          create.mutate();
+        }}
+        className="space-y-3"
+      >
+        <Field label="Name">
+          <TextInput value={name} onChange={(e) => setName(e.target.value)} placeholder="My gateway" autoFocus />
+        </Field>
+        <Field label="Base URL">
+          <TextInput value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://host/v1" />
+        </Field>
+        <Field label="API key">
+          <TextInput value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="optional for open endpoints" />
+        </Field>
+        <Field label="Protocol">
+          <select className="input" value={protocol} onChange={(e) => setProtocol(e.target.value)}>
+            <option value="openai">OpenAI-compatible</option>
+            <option value="anthropic">Anthropic</option>
+          </select>
+        </Field>
+        <ErrorText msg={err} />
+        <div className="flex justify-end gap-2 pt-1">
+          <Button type="button" variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" disabled={create.isPending || !name || !baseUrl}>
+            Create
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <label className="block space-y-1">
+      <span className="text-xs font-medium text-[var(--muted)]">{label}</span>
+      {children}
+      {hint && <span className="block text-[11px] leading-snug text-[var(--faint)]">{hint}</span>}
+    </label>
+  );
+}
+
+function DeleteConnection({ id, onDone }: { id: number; onDone: () => void }) {
+  const del = useMutation({
+    mutationFn: async () => {
+      await api(`/api/admin/providers/${id}`, { method: "DELETE" });
+    },
+    onSuccess: onDone,
+  });
+  return (
+    <button
+      className="text-red-600 hover:underline"
+      onClick={() => {
+        if (confirm("Delete this connection and its cached models?")) del.mutate();
+      }}
+    >
+      Delete
+    </button>
+  );
+}
+
+// ---- per-connection model grid ---------------------------------------------
+
+function ModelsDrawer({ conn, onClose }: { conn: ProviderRow; onClose: () => void }) {
+  const qc = useQueryClient();
+  const [filter, setFilter] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  const cached = useQuery({
+    queryKey: ["cached-models", conn.id],
+    queryFn: () => api<CachedModel[]>(`/api/admin/providers/${conn.id}/cached-models`),
+    refetchInterval: 5000,
+  });
+  const fetchModels = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(`/api/admin/providers/${conn.id}/fetch-models`, { method: "POST" });
+      if (!r.ok) throw new Error(((await r.json()) as any).error?.message ?? `HTTP ${r.status}`);
+      return r.json();
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["cached-models", conn.id] });
+      qc.invalidateQueries({ queryKey: ["providers"] });
+      setErr(null);
+    },
+    onError: (e) => setErr((e as Error).message),
+  });
+  const toggle = useMutation({
+    mutationFn: async (m: CachedModel) => {
+      await api(`/api/admin/providers/${conn.id}/models/toggle`, {
+        method: "POST",
+        body: JSON.stringify({ upstream_id: m.upstream_id, enabled: !m.enabled }),
+      });
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["cached-models", conn.id] });
+      qc.invalidateQueries({ queryKey: ["providers"] });
+    },
+  });
+
+  const list = (cached.data ?? []).filter(
+    (m) =>
+      !filter ||
+      m.upstream_id.toLowerCase().includes(filter.toLowerCase()) ||
+      m.display_name.toLowerCase().includes(filter.toLowerCase())
+  );
+
+  return (
+    <Modal title={`${conn.name} — models`} onClose={onClose} wide>
+      <div className="space-y-3">
+        <div className="flex items-center gap-2">
+          <TextInput
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder="Filter models..."
+            className="max-w-xs"
+          />
+          <Button variant="secondary" disabled={fetchModels.isPending} onClick={() => fetchModels.mutate()}>
+            {fetchModels.isPending ? "Fetching..." : "Fetch latest"}
+          </Button>
+        </div>
+        <p className="text-[11px] text-[var(--faint)]">
+          Enabled models are served as <span className="mono">{conn.slug}/&lt;model&gt;</span>. Toggle pulls straight from the cache — hit “Fetch latest” to pull newly released models from the provider.
+        </p>
+        <ErrorText msg={err} />
+        {cached.isLoading ? (
+          <div className="skeleton h-64" />
+        ) : list.length === 0 ? (
+          <p className="rounded-[var(--radius)] border border-dashed border-[var(--panel-edge)] p-6 text-center text-sm text-[var(--muted)]">
+            Cache empty — press “Fetch latest” to pull the model list from {conn.name}.
+          </p>
+        ) : (
+          <div className="grid max-h-[50vh] grid-cols-1 gap-1 overflow-y-auto md:grid-cols-2 xl:grid-cols-3">
+            {list.map((m) => (
+              <button
+                key={m.upstream_id}
+                onClick={() => toggle.mutate(m)}
+                className={`flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-left transition-colors ${
+                  m.enabled
+                    ? "border-emerald-300 bg-emerald-50 hover:bg-emerald-100"
+                    : "border-[var(--panel-edge)] bg-[var(--panel)] hover:bg-[var(--inset)]"
+                }`}
+              >
+                <span className="min-w-0">
+                  <span className="block truncate text-xs font-medium">{m.display_name || m.upstream_id}</span>
+                  <span className="mono block truncate text-[10px] text-[var(--faint)]">{m.upstream_id}</span>
+                </span>
+                <span className={`shrink-0 text-[10px] font-semibold ${m.enabled ? "text-emerald-700" : "text-[var(--faint)]"}`}>
+                  {m.enabled ? "ON" : "off"}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+export default function ProvidersDefault() {
+  return <ProvidersPage />;
 }

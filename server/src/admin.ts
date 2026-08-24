@@ -4,6 +4,8 @@ import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { db, getSetting, setSetting } from "./db";
 import { BadRequest, parseJson, str, optStr, intOrNull, bool } from "./validate";
 import type { Context, Handler } from "hono";
+import { CATALOG, catalogGet } from "./catalog";
+import { getSaversConfig, setSaversConfig } from "./savers-config";
 
 export const admin = new Hono();
 
@@ -404,7 +406,334 @@ admin.post("/keys/:id/share", async (c) => {
   return c.json({ share_slug: slug });
 });
 
-// ---------- usage series ----------
+// ---------- provider catalog (built-in, 9Router-style) ----------
+
+admin.get("/catalog", (c) => {
+  const connected = new Set(
+    (db.query("SELECT slug FROM providers WHERE catalog != 'custom'").all() as any[]).map((r) => r.slug)
+  );
+  return c.json(
+    CATALOG.map((e) => ({
+      id: e.id,
+      name: e.name,
+      protocol: e.protocol,
+      category: e.category,
+      website: e.website ?? null,
+      notice: e.notice ?? null,
+      has_models_fetch: !!e.modelsUrl,
+      connected_count: connected.has(e.id)
+        ? (db.query("SELECT COUNT(*) AS n FROM providers WHERE slug = ?").get(e.id) as any).n
+        : 0,
+    }))
+  );
+});
+
+// add a connection to a catalog provider (or a custom one with explicit base_url)
+admin.post("/providers/connect", async (c) => {
+  const b = await parseJson(c);
+  const catalogId = optStr(b.catalog, 60) ?? "custom";
+  let baseUrl: string;
+  let name: string;
+  let protocol: string;
+  let extra = "{}";
+
+  if (catalogId !== "custom") {
+    const entry = catalogGet(catalogId);
+    if (!entry) throw new BadRequest(`unknown catalog provider '${catalogId}'`);
+    // multiple connections per catalog id -> slug-2, slug-3...
+    const existing = db.query("SELECT COUNT(*) AS n FROM providers WHERE slug LIKE ?").all(catalogId + "%").length;
+    const n = (db.query("SELECT COUNT(*) AS n FROM providers WHERE catalog = ?").get(catalogId) as any).n;
+    void existing;
+    const slug = n === 0 ? catalogId : `${catalogId}-${n + 1}`;
+    name = optStr(b.name, 80) ?? entry.name + (n === 0 ? "" : ` ${n + 1}`);
+    baseUrl = entry.baseUrl;
+    protocol = entry.protocol;
+    if (entry.extraHeaders) extra = JSON.stringify(entry.extraHeaders);
+    const r = db
+      .query(
+        `INSERT INTO providers (slug, name, catalog, base_url, api_key, protocol, extra_headers, created_at)
+         VALUES (?,?,?,?,?,?,?,?)`
+      )
+      .run(slug, name, catalogId, baseUrl, typeof b.api_key === "string" ? b.api_key.trim() : "", protocol, extra, Date.now());
+    return c.json({ id: Number(r.lastInsertRowid), slug }, 201);
+  }
+
+  // custom connection — old behavior
+  name = str(b.name, "name", 80);
+  baseUrl = str(b.base_url, "base_url", 500);
+  if (!/^https?:\/\//.test(baseUrl)) throw new BadRequest("base_url must start with http(s)://");
+  const base =
+    (optStr(b.slug, 60) ??
+      name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "").slice(0, 40)) ||
+    "p-" + Date.now().toString(36);
+  if (!SLUG_RE.test(base)) throw new BadRequest("slug must be [a-z0-9-]");
+  let slug = base;
+  let n = 2;
+  while (db.query("SELECT 1 FROM providers WHERE slug = ?").get(slug)) {
+    slug = `${base}-${n++}`;
+    if (n > 50) throw new BadRequest("could not derive a unique slug");
+  }
+  protocol = b.protocol === "anthropic" ? "anthropic" : "openai";
+  if (b.extra_headers !== undefined) {
+    if (typeof b.extra_headers !== "object" || Array.isArray(b.extra_headers))
+      throw new BadRequest("extra_headers must be an object");
+    extra = JSON.stringify(b.extra_headers);
+  }
+  const r = db
+    .query(
+      `INSERT INTO providers (slug, name, catalog, base_url, api_key, protocol, extra_headers, created_at)
+       VALUES (?,?,?,?,?,?,?,?)`
+    )
+    .run(slug, name, "custom", baseUrl.replace(/\/+$/, ""), typeof b.api_key === "string" ? b.api_key.trim() : "", protocol, extra, Date.now());
+  return c.json({ id: Number(r.lastInsertRowid), slug }, 201);
+});
+
+// fetch live models from the upstream and cache them (models_cache)
+admin.post("/providers/:id/fetch-models", async (c) => {
+  const p = db.query("SELECT * FROM providers WHERE id=?").get(intOrNull(c.req.param("id"), "id")) as any;
+  if (!p) return c.json({ error: { code: "not_found", message: "no such provider" } }, 404);
+  const entry = p.catalog && p.catalog !== "custom" ? catalogGet(p.catalog) : undefined;
+
+  try {
+    const url = entry?.modelsUrl ?? p.base_url.replace(/\/+$/, "") + "/models";
+    const headers: Record<string, string> = {};
+    if (p.api_key) {
+      if (entry?.auth === "x-api-key") headers["x-api-key"] = p.api_key;
+      else headers["authorization"] = `Bearer ${p.api_key}`;
+    }
+    for (const [k, v] of Object.entries(entry?.extraHeaders ?? {})) headers[k] = String(v);
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
+    if (!res.ok)
+      return c.json({ error: { code: "fetch_failed", message: `upstream ${res.status}` } }, 502);
+    const j: any = await res.json().catch(() => null);
+    let models: { id: string; name: string }[] = [];
+    const picker = entry?.modelsPicker ?? "openai";
+    if (picker === "openrouter" || picker === "openai") {
+      models = (j?.data ?? [])
+        .filter((d: any) => typeof d?.id === "string")
+        .map((d: any) => ({ id: d.id as string, name: String(d.name ?? d.id) }));
+    } else if (picker === "gemini") {
+      models = (j?.models ?? [])
+        .filter((d: any) => typeof d?.name === "string")
+        .map((d: any) => ({ id: (d.name as string).replace(/^models\//, ""), name: d.displayName ?? d.name }));
+    } else {
+      // bare array
+      models = (Array.isArray(j) ? j : [])
+        .filter((d: any) => typeof d?.id === "string")
+        .map((d: any) => ({ id: d.id as string, name: String(d.name ?? d.id) }));
+    }
+    // keep only chat-ish models for together-style big lists
+    if (picker === "together") {
+      models = models.filter(
+        (m: any) => !/embed|whisper|tts|rerank|guard|vision|diffusion|speech|bge-/i.test(m.id)
+      );
+    }
+    const now = Date.now();
+    db.query("DELETE FROM models_cache WHERE provider_id = ?").run(p.id);
+    const ins = db.query(
+      "INSERT OR IGNORE INTO models_cache (provider_id, upstream_id, display_name, fetched_at) VALUES (?,?,?,?)"
+    );
+    for (const m of models) ins.run(p.id, m.id, m.name.slice(0, 200), now);
+    return c.json({ count: models.length });
+  } catch (e: any) {
+    return c.json({ error: { code: "fetch_failed", message: e?.message ?? "fetch failed" } }, 502);
+  }
+});
+
+// list cached models of a connection
+admin.get("/providers/:id/cached-models", (c) => {
+  const pid = intOrNull(c.req.param("id"), "id");
+  const rows = db
+    .query("SELECT upstream_id, display_name FROM models_cache WHERE provider_id = ? ORDER BY upstream_id")
+    .all(pid);
+  const enabled = new Set(
+    (db.query("SELECT upstream_id FROM models WHERE provider_id = ? AND enabled = 1").all(pid) as any[]).map((r) => r.upstream_id)
+  );
+  return c.json(rows.map((r: any) => ({ ...r, enabled: enabled.has(r.upstream_id) })));
+});
+
+// enable/disable a model row directly from the cache grid (auto-add on first toggle)
+admin.post("/providers/:id/models/toggle", async (c) => {
+  const pid = intOrNull(c.req.param("id"), "id");
+  const p = db.query("SELECT * FROM providers WHERE id=?").get(pid) as any;
+  if (!p) throw new BadRequest("no such provider");
+  const b = await parseJson(c);
+  const upstreamId = str(b.upstream_id, "upstream_id", 200);
+  const enable = bool(b.enabled);
+  const existing = db
+    .query("SELECT id, enabled FROM models WHERE provider_id=? AND upstream_id=?")
+    .get(pid, upstreamId) as any;
+  if (existing) {
+    db.query("UPDATE models SET enabled=? WHERE id=?").run(enable ? 1 : 0, existing.id);
+    return c.json({ ok: true, id: existing.id });
+  }
+  if (!enable) return c.json({ ok: true }); // disabling a non-row is fine
+  // auto-add: public_id = "<slug>/<upstream>" (9Router style), thinking heuristic by name
+  const thinky = /thinking|reason|o[1345]|r1|qwq|deepseek/i.test(upstreamId);
+  const publicId = `${p.slug}/${upstreamId}`;
+  const r = db
+    .query(
+      `INSERT INTO models (provider_id, upstream_id, public_id, thinking_supported, min_thinking, max_thinking, enabled, sort)
+       VALUES (?,?,?,?,?,?,1,0)`
+    )
+    .run(pid, upstreamId, publicId, thinky ? 1 : 0, thinky ? 1024 : 0, thinky ? 32768 : 0);
+  return c.json({ ok: true, id: Number(r.lastInsertRowid) }, 201);
+});
+
+// test a connection: cheap auth'd GET to base_url/models
+admin.post("/providers/:id/test", async (c) => {
+  const p = db.query("SELECT * FROM providers WHERE id=?").get(intOrNull(c.req.param("id"), "id")) as any;
+  if (!p) return c.json({ error: { code: "not_found", message: "no such provider" } }, 404);
+  const entry = p.catalog && p.catalog !== "custom" ? catalogGet(p.catalog) : undefined;
+  try {
+    const url = entry?.modelsUrl ?? p.base_url.replace(/\/+$/, "") + "/models";
+    const headers: Record<string, string> = {};
+    if (p.api_key) {
+      if (entry?.auth === "x-api-key") headers["x-api-key"] = p.api_key;
+      else headers["authorization"] = `Bearer ${p.api_key}`;
+    }
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(12_000) });
+    return c.json({ ok: res.ok, status: res.status });
+  } catch (e: any) {
+    return c.json({ ok: false, status: 0, error: e?.message ?? "unreachable" });
+  }
+});
+
+// ---------- combos ----------
+
+admin.get("/combos", (c) => {
+  const rows = db.query("SELECT * FROM combos ORDER BY id").all() as any[];
+  const all = db.query("SELECT combo_id, position, target, weight FROM combo_models ORDER BY combo_id, position").all() as any[];
+  const byCombo = new Map<number, any[]>();
+  for (const cm of all) {
+    if (!byCombo.has(cm.combo_id)) byCombo.set(cm.combo_id, []);
+    byCombo.get(cm.combo_id)!.push(cm);
+  }
+  return c.json(rows.map((r) => ({ ...r, models: byCombo.get(r.id) ?? [] })));
+});
+
+const COMBO_TARGET_RE = /^[a-z0-9][a-z0-9-]{0,40}:[^\s:\/]+$/;
+
+function validateComboTargets(targets: any[]) {
+  if (!Array.isArray(targets) || targets.length === 0) throw new BadRequest("models must be a non-empty array");
+  if (targets.length > 10) throw new BadRequest("max 10 models per combo");
+  for (const t of targets) {
+    if (typeof t !== "string" && typeof t?.target !== "string") throw new BadRequest("each model must be a target string");
+    const s = typeof t === "string" ? t : t.target;
+    if (!COMBO_TARGET_RE.test(s))
+      throw new BadRequest(`combo target '${s}' must look like '<providerSlug>:<upstreamModelId>'`);
+  }
+}
+
+admin.post("/combos", async (c) => {
+  const b = await parseJson(c);
+  const publicId = str(b.public_id, "public_id", 120);
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._\/-]{0,118}$/.test(publicId)) throw new BadRequest("invalid public_id");
+  const strategy = b.strategy === "round_robin" || b.strategy === "weighted" ? b.strategy : "fallback";
+  validateComboTargets(b.models);
+  const r = db.query("INSERT INTO combos (public_id, strategy, enabled) VALUES (?,?,1)").run(publicId, strategy);
+  const cid = Number(r.lastInsertRowid);
+  const ins = db.query("INSERT INTO combo_models (combo_id, position, target, weight) VALUES (?,?,?,?)");
+  (b.models as any[]).forEach((m, i) => {
+    const target = typeof m === "string" ? m : m.target;
+    const weight = typeof m === "object" && Number.isFinite(m.weight) ? Math.max(1, Math.min(10000, Math.round(m.weight))) : 100;
+    ins.run(cid, i, target, weight);
+  });
+  return c.json({ id: cid }, 201);
+});
+
+admin.patch("/combos/:id", async (c) => {
+  const id = intOrNull(c.req.param("id"), "id");
+  const row = db.query("SELECT * FROM combos WHERE id=?").get(id) as any;
+  if (!row) return c.json({ error: { code: "not_found", message: "no such combo" } }, 404);
+  const b = await parseJson(c);
+  const publicId = optStr(b.public_id, 120) ?? row.public_id;
+  const strategy = b.strategy === "fallback" || b.strategy === "round_robin" || b.strategy === "weighted" ? b.strategy : row.strategy;
+  const enabled = b.enabled === undefined ? !!row.enabled : bool(b.enabled);
+  db.query("UPDATE combos SET public_id=?, strategy=?, enabled=? WHERE id=?").run(publicId, strategy, enabled ? 1 : 0, id);
+  if (b.models !== undefined) {
+    validateComboTargets(b.models);
+    db.query("DELETE FROM combo_models WHERE combo_id=?").run(id);
+    const ins = db.query("INSERT INTO combo_models (combo_id, position, target, weight) VALUES (?,?,?,?)");
+    (b.models as any[]).forEach((m, i) => {
+      const target = typeof m === "string" ? m : m.target;
+      const weight = typeof m === "object" && Number.isFinite(m.weight) ? Math.max(1, Math.min(10000, Math.round(m.weight))) : 100;
+      ins.run(id, i, target, weight);
+    });
+  }
+  return c.json({ ok: true });
+});
+
+admin.delete("/combos/:id", (c) => {
+  db.query("DELETE FROM combos WHERE id=?").run(intOrNull(c.req.param("id"), "id"));
+  return c.json({ ok: true });
+});
+
+// ---------- quota tracker ----------
+// Best-effort snapshots. Providers with usage APIs can be filled by /refresh;
+// otherwise the dashboard tracks local consumption vs the key's own limit.
+
+admin.get("/quota", (c) => {
+  const rows = db
+    .query(
+      `SELECT q.connection_id, p.slug, p.name, p.catalog,
+              q.window_kind, q.used, q.total, q.remaining, q.resets_at, q.fetched_at
+       FROM quota q JOIN providers p ON p.id = q.connection_id
+       ORDER BY p.name`
+    )
+    .all();
+  return c.json(rows);
+});
+
+admin.post("/quota/refresh", async (c) => {
+  // Anthropic supports an OAuth usage endpoint only; OpenAI-compatible providers don't
+  // expose quota generically. Refresh what we can; everything else stays locally derived.
+  const conns = db.query("SELECT * FROM providers WHERE catalog != 'custom'").all() as any[];
+  let updated = 0;
+  for (const p of conns) {
+    const entry = catalogGet(p.catalog);
+    if (!entry?.usageUrl || !p.api_key) continue;
+    try {
+      const headers: Record<string, string> = {};
+      if (entry.auth === "x-api-key") headers["x-api-key"] = p.api_key;
+      else headers["authorization"] = `Bearer ${p.api_key}`;
+      const res = await fetch(entry.usageUrl, { headers, signal: AbortSignal.timeout(10_000) });
+      if (!res.ok) continue;
+      const j: any = await res.json().catch(() => null);
+      if (!j) continue;
+      const used = Number(j.used ?? j.current_usage ?? 0);
+      const total = Number(j.limit ?? j.max_usage ?? 0);
+      const resetsAt = Number(j.reset_at ?? j.reset_date ?? 0) * (String(j.reset_at ?? "").length <= 10 ? 1000 : 1);
+      db.query(
+        `INSERT INTO quota (connection_id, window_kind, used, total, remaining, resets_at, fetched_at)
+         VALUES (?,?,?,?,?,?,?)
+         ON CONFLICT(connection_id) DO UPDATE SET used=excluded.used, total=excluded.total,
+           remaining=excluded.remaining, resets_at=excluded.resets_at, fetched_at=excluded.fetched_at`
+      ).run(p.id, String(j.window_kind ?? ""), used || null, total || null, total ? Math.max(0, total - used) : null, resetsAt || null, Date.now());
+      updated++;
+    } catch {}
+  }
+  return c.json({ updated });
+});
+
+// ---------- token savers settings ----------
+
+admin.get("/settings/savers", (c) => c.json(getSaversConfig()));
+
+admin.patch("/settings/savers", async (c) => {
+  const b = await parseJson(c);
+  const allowedKeys = ["rtk", "headroom", "caveman", "ponytail"] as const;
+  const next: any = {};
+  for (const k of allowedKeys) {
+    const v = (b as any)[k];
+    if (v === undefined) continue;
+    if (!["off", "lite", "full", "ultra"].includes(v)) throw new BadRequest(`${k} must be off|lite|full|ultra`);
+    next[k] = v;
+  }
+  return c.json(setSaversConfig(next));
+});
+
+
 
 admin.get("/usage", (c) => {
   const days = Math.min(90, Math.max(1, intOrNull(c.req.query("days"), "days", 1) ?? 14));
@@ -432,8 +761,14 @@ admin.get("/usage", (c) => {
        FROM usage u WHERE ${where} GROUP BY u.model ORDER BY tokens DESC LIMIT 15`
     )
     .all(...params);
+  const perProvider = db
+    .query(
+      `SELECT u.provider_slug, COUNT(*) AS requests, COALESCE(SUM(u.prompt_tokens+u.completion_tokens),0) AS tokens
+       FROM usage u WHERE ${where} GROUP BY u.provider_slug ORDER BY tokens DESC`
+    )
+    .all(...params);
   const errors = db
     .query(`SELECT COUNT(*) AS n FROM usage u WHERE ${where} AND u.status >= 400`)
     .get(...params) as any;
-  return c.json({ daily, perModel, errors: errors.n ?? 0, days });
+  return c.json({ daily, perModel, perProvider, errors: errors.n ?? 0, days });
 });

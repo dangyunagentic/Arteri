@@ -5,9 +5,11 @@ import { useAuth, api } from "./api";
 const NAV = [
   { to: "/console", label: "Overview" },
   { to: "/console/providers", label: "Providers" },
-  { to: "/console/models", label: "Models" },
+  { to: "/console/combos", label: "Combos" },
   { to: "/console/keys", label: "API Keys" },
+  { to: "/console/quota", label: "Quota" },
   { to: "/console/usage", label: "Usage" },
+  { to: "/console/settings", label: "Token Savers" },
 ] as const;
 
 function Mark() {

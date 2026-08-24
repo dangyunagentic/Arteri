@@ -43,11 +43,13 @@ export function Button({
   className = "",
   ...props
 }: React.ButtonHTMLAttributes<HTMLButtonElement> & {
-  variant?: "primary" | "ghost" | "danger";
+  variant?: "primary" | "secondary" | "ghost" | "danger";
 }) {
   const styles: Record<string, string> = {
     primary:
       "bg-[var(--accent)] text-white hover:bg-[var(--accent-dim)] active:bg-[var(--accent-dim)] border border-transparent",
+    secondary:
+      "bg-transparent text-[var(--ink)] hover:bg-[var(--panel-edge)] border border-[var(--panel-edge)]",
     ghost:
       "bg-transparent text-[var(--ink)] hover:bg-[var(--panel-edge)] border border-[var(--panel-edge)]",
     danger:
@@ -65,11 +67,13 @@ export function Badge({
   tone = "neutral",
   children,
 }: {
-  tone?: "neutral" | "ok" | "warn" | "err" | "accent";
+  tone?: "neutral" | "ok" | "warn" | "err" | "accent" | "muted" | "info";
   children: ReactNode;
 }) {
   const tones: Record<string, string> = {
     neutral: "text-[var(--muted)] border-[var(--panel-edge)]",
+    muted: "text-[var(--muted)] border-[var(--panel-edge)]",
+    info: "text-[var(--blue)] border-[rgba(89,167,255,.35)]",
     ok: "text-[var(--green)] border-[rgba(61,214,140,.35)]",
     warn: "text-[var(--amber)] border-[rgba(255,180,84,.35)]",
     err: "text-[var(--red)] border-[rgba(217,45,32,.4)]",
@@ -116,13 +120,13 @@ export function Toggle({
 }
 
 export function Modal({
-  open,
+  open = true,
   onClose,
   title,
   children,
   wide,
 }: {
-  open: boolean;
+  open?: boolean;
   onClose: () => void;
   title: string;
   children: ReactNode;
@@ -160,11 +164,12 @@ export function Modal({
   );
 }
 
-export function ErrorText({ children }: { children?: ReactNode }) {
-  if (!children) return null;
+export function ErrorText({ children, msg }: { children?: ReactNode; msg?: string | null }) {
+  const text = msg ?? children;
+  if (!text) return null;
   return (
     <p className="mt-2 rounded-[var(--radius)] border border-[rgba(217,45,32,.3)] bg-[rgba(217,45,32,.06)] px-2.5 py-1.5 text-xs text-[var(--red)]">
-      {String(children)}
+      {String(text)}
     </p>
   );
 }
