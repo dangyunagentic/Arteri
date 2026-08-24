@@ -115,6 +115,17 @@ try {
 } catch {
   /* column exists */
 }
+for (const stmt of [
+  "ALTER TABLE providers ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'apikey'", // apikey|oauth
+  "ALTER TABLE providers ADD COLUMN email TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE providers ADD COLUMN tokens TEXT NOT NULL DEFAULT ''", // encrypted-at-rest-ish JSON blob (access/refresh/expires)
+]) {
+  try {
+    db.exec(stmt);
+  } catch {
+    /* exists */
+  }
+}
 
 export function getSetting(key: string): string | null {
   const row = db.query("SELECT value FROM settings WHERE key = ?").get(key) as

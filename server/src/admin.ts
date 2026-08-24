@@ -6,6 +6,8 @@ import { BadRequest, parseJson, str, optStr, intOrNull, bool } from "./validate"
 import type { Context, Handler } from "hono";
 import { CATALOG, catalogGet } from "./catalog";
 import { getSaversConfig, setSaversConfig } from "./savers-config";
+import { OAUTH_CATALOG, catalogAny } from "./catalog";
+import { startOAuth, exchangeCode, parseBulkTokens } from "./oauth";
 
 export const admin = new Hono();
 
@@ -152,7 +154,9 @@ admin.get("/overview", (c) => {
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,40}$/;
 
 admin.get("/providers", (c) => {
-  const rows = db.query("SELECT id, slug, name, base_url, protocol, extra_headers, created_at FROM providers ORDER BY id").all();
+  const rows = db
+    .query("SELECT id, slug, name, catalog, base_url, protocol, extra_headers, created_at, auth_type, email FROM providers ORDER BY id")
+    .all();
   const counts = db.query("SELECT provider_id, COUNT(*) AS n FROM models GROUP BY provider_id").all() as any[];
   const map = new Map(counts.map((r) => [r.provider_id, r.n]));
   // mask api_key presence only
@@ -406,7 +410,187 @@ admin.post("/keys/:id/share", async (c) => {
   return c.json({ share_slug: slug });
 });
 
-// ---------- provider catalog (built-in, 9Router-style) ----------
+// ---------- OAuth providers (subscription accounts) ----------
+// state -> { verifier, catalogId, redirectUri, createdAt } (in-memory, 10 min TTL)
+const oauthPending = new Map<string, { verifier: string; catalogId: string; redirectUri: string; ts: number }>();
+
+admin.get("/oauth/catalog", (c) =>
+  c.json(
+    OAUTH_CATALOG.map((e) => ({
+      id: e.id,
+      name: e.name,
+      website: e.website ?? null,
+      notice: e.notice ?? null,
+      supports_bulk: e.id === "openai-codex",
+      models: e.staticModels ?? [],
+    }))
+  )
+);
+
+// begin interactive oauth: returns the URL the admin opens in a browser
+admin.post("/oauth/:catalog/start", async (c) => {
+  const entry = catalogAny(c.req.param("catalog"));
+  if (!entry?.oauth) throw new BadRequest("not an oauth provider");
+  const redirectUri = `${process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || "http://localhost:8787"}/api/admin/oauth/${entry.id}/callback`;
+  const started = startOAuth(entry, redirectUri);
+  oauthPending.set(started.state, {
+    verifier: started.verifier,
+    catalogId: entry.id,
+    redirectUri,
+    ts: Date.now(),
+  });
+  // gc old entries
+  for (const [k, v] of oauthPending) if (Date.now() - v.ts > 600_000) oauthPending.delete(k);
+  return c.json({ authorize_url: started.url, state: started.state });
+});
+
+// browser hits this after consent — exchange code, store tokens on a new connection row
+admin.get("/oauth/:catalog/callback", async (c) => {
+  const entry = catalogAny(c.req.param("catalog"));
+  if (!entry?.oauth) return c.text("unknown oauth provider", 400);
+  const code = c.req.query("code");
+  const state = c.req.query("state");
+  if (!code || !state) return c.text("missing code/state", 400);
+  const pending = oauthPending.get(state);
+  if (!pending) return c.text("expired or unknown state — restart the flow", 400);
+  oauthPending.delete(state);
+  const xchg = await exchangeCode(entry, code, pending.verifier, pending.redirectUri);
+  if (!xchg.ok || !xchg.tokens)
+    return c.text(`token exchange failed: ${xchg.error ?? "?"}`, 502);
+
+  // create connection row for this account
+  const n = (db.query("SELECT COUNT(*) AS n FROM providers WHERE catalog = ?").get(entry.id) as any).n;
+  const slug = n === 0 ? entry.id : `${entry.id}-${n + 1}`;
+  const r = db
+    .query(
+      `INSERT INTO providers (slug, name, catalog, base_url, api_key, protocol, extra_headers, created_at, auth_type, email, tokens)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+    )
+    .run(
+      slug,
+      entry.name + (n === 0 ? "" : ` ${n + 1}`),
+      entry.id,
+      entry.baseUrl,
+      "", // no api key; bearer comes from tokens
+      entry.protocol,
+      JSON.stringify(entry.extraHeaders ?? {}),
+      Date.now(),
+      "oauth",
+      xchg.email ?? "",
+      JSON.stringify(xchg.tokens)
+    );
+  // seed model rows from static list (all enabled)
+  const pid = Number(r.lastInsertRowid);
+  const ins = db.query(
+    `INSERT OR IGNORE INTO models (provider_id, upstream_id, public_id, thinking_supported, min_thinking, max_thinking, enabled, sort)
+     VALUES (?,?,?,?,?,?,1,0)`
+  );
+  (entry.staticModels ?? []).forEach((m) =>
+    ins.run(pid, m.id, `${slug}/${m.id}`, /opus|sonnet|thinking|o[1345]/i.test(m.id) ? 1 : 0, 1024, 65536)
+  );
+  return c.redirect(`/console/providers?connected=${encodeURIComponent(entry.id)}`);
+});
+
+// manual paste of the callback URL (same flow, headless-friendly)
+admin.post("/oauth/:catalog/finish", async (c) => {
+  const entry = catalogAny(c.req.param("catalog"));
+  if (!entry?.oauth) throw new BadRequest("not an oauth provider");
+  const b = await parseJson(c);
+  const callbackUrl = str(b.callback_url, "callback_url", 2000);
+  let u: URL;
+  try {
+    u = new URL(callbackUrl);
+  } catch {
+    throw new BadRequest("paste the full callback URL including ?code=...&state=...");
+  }
+  const code = u.searchParams.get("code");
+  const state = u.searchParams.get("state");
+  if (!code || !state) throw new BadRequest("callback URL has no code/state");
+  const pending = oauthPending.get(state);
+  if (!pending) throw new BadRequest("expired or unknown state — restart the flow");
+  oauthPending.delete(state);
+  const xchg = await exchangeCode(entry, code, pending.verifier, pending.redirectUri);
+  if (!xchg.ok || !xchg.tokens) throw new BadRequest(`token exchange failed: ${xchg.error ?? "?"}`);
+  const n = (db.query("SELECT COUNT(*) AS n FROM providers WHERE catalog = ?").get(entry.id) as any).n;
+  const slug = n === 0 ? entry.id : `${entry.id}-${n + 1}`;
+  const r = db
+    .query(
+      `INSERT INTO providers (slug, name, catalog, base_url, api_key, protocol, extra_headers, created_at, auth_type, email, tokens)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+    )
+    .run(
+      slug,
+      entry.name + (n === 0 ? "" : ` ${n + 1}`),
+      entry.id,
+      entry.baseUrl,
+      "",
+      entry.protocol,
+      JSON.stringify(entry.extraHeaders ?? {}),
+      Date.now(),
+      "oauth",
+      xchg.email ?? "",
+      JSON.stringify(xchg.tokens)
+    );
+  const pid = Number(r.lastInsertRowid);
+  const ins = db.query(
+    `INSERT OR IGNORE INTO models (provider_id, upstream_id, public_id, thinking_supported, min_thinking, max_thinking, enabled, sort)
+     VALUES (?,?,?,?,?,?,1,0)`
+  );
+  (entry.staticModels ?? []).forEach((m) =>
+    ins.run(pid, m.id, `${slug}/${m.id}`, /opus|sonnet|thinking|o[1345]/i.test(m.id) ? 1 : 0, 1024, 65536)
+  );
+  return c.json({ id: pid, slug, email: xchg.email ?? "" }, 201);
+});
+
+// bulk import token JSON (Codex CLI auth.json style)
+admin.post("/oauth/:catalog/import", async (c) => {
+  const entry = catalogAny(c.req.param("catalog"));
+  if (!entry?.oauth) throw new BadRequest("not an oauth provider");
+  const b = await parseJson(c);
+  const raw = typeof b.json === "string" ? b.json : JSON.stringify(b.json);
+  let items;
+  try {
+    items = parseBulkTokens(entry, raw);
+  } catch {
+    throw new BadRequest("invalid JSON — paste the contents of ~/.codex/auth.json or an array of accounts");
+  }
+  if (!items.length) throw new BadRequest("no usable accounts found (need accessToken/refreshToken)");
+  const baseN = (db.query("SELECT COUNT(*) AS n FROM providers WHERE catalog = ?").get(entry.id) as any).n;
+  const insP = db.query(
+    `INSERT INTO providers (slug, name, catalog, base_url, api_key, protocol, extra_headers, created_at, auth_type, email, tokens)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+  );
+  const insM = db.query(
+    `INSERT OR IGNORE INTO models (provider_id, upstream_id, public_id, thinking_supported, min_thinking, max_thinking, enabled, sort)
+     VALUES (?,?,?,?,?,?,1,0)`
+  );
+  let created = 0;
+  items.forEach((item, idx) => {
+    const seq = baseN + ++idx;
+    const slug = seq === 1 && baseN === 0 ? entry.id : `${entry.id}-${seq}`;
+    const r = insP.run(
+      slug,
+      entry.name + (baseN + idx === 1 ? "" : ` ${baseN + idx}`),
+      entry.id,
+      entry.baseUrl,
+      "",
+      entry.protocol,
+      JSON.stringify(entry.extraHeaders ?? {}),
+      Date.now(),
+      "oauth",
+      item.email ?? "",
+      JSON.stringify(item.tokens)
+    );
+    const pid = Number(r.lastInsertRowid);
+    (entry.staticModels ?? []).forEach((m) =>
+      insM.run(pid, m.id, `${slug}/${m.id}`, /opus|sonnet|thinking|o[1345]/i.test(m.id) ? 1 : 0, 1024, 65536)
+    );
+    created++;
+  });
+  return c.json({ created }, 201);
+});
+
+
 
 admin.get("/catalog", (c) => {
   const connected = new Set(

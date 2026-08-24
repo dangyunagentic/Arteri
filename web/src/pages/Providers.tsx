@@ -1,18 +1,26 @@
-// Providers — 9Router-style catalog grid + per-connection model grid.
+// Providers — three catalog sections (OAuth / Free tier / API key) + connections.
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api, type ApiError } from "../api";
-import { Badge, Button, ErrorText, Modal, TextInput } from "../ui";
+import { useOverlays } from "../toast";
+import { Badge, Button, CopyBtn, ErrorText, Field, Modal, TextInput } from "../ui";
 
 interface CatalogRow {
   id: string;
   name: string;
   protocol: string;
-  category: "key" | "free" | "cloud";
+  category: "key" | "free" | "cloud" | "oauth";
   website: string | null;
   notice: string | null;
   has_models_fetch: boolean;
   connected_count: number;
+}
+interface OAuthCatalogRow {
+  id: string;
+  name: string;
+  website: string | null;
+  notice: string | null;
+  supports_bulk: boolean;
 }
 interface ProviderRow {
   id: number;
@@ -23,6 +31,8 @@ interface ProviderRow {
   protocol: string;
   has_key: boolean;
   model_count: number;
+  auth_type?: "apikey" | "oauth";
+  email?: string;
 }
 interface CachedModel {
   upstream_id: string;
@@ -43,6 +53,10 @@ export function ProvidersPage() {
     queryFn: () => api<CatalogRow[]>("/api/admin/catalog"),
     refetchInterval: 15_000,
   });
+  const oauthCatalog = useQuery({
+    queryKey: ["oauth-catalog"],
+    queryFn: () => api<OAuthCatalogRow[]>("/api/admin/oauth/catalog"),
+  });
   const providers = useQuery({
     queryKey: ["providers"],
     queryFn: () => api<ProviderRow[]>("/api/admin/providers"),
@@ -52,6 +66,10 @@ export function ProvidersPage() {
   const [connectFor, setConnectFor] = useState<CatalogRow | null>(null);
   const [customOpen, setCustomOpen] = useState(false);
   const [openConn, setOpenConn] = useState<ProviderRow | null>(null);
+  const [oauthFor, setOauthFor] = useState<OAuthCatalogRow | null>(null);
+
+  const apiKeyProviders = (catalog.data ?? []).filter((e) => e.category === "key" || e.category === "cloud");
+  const freeTierProviders = (catalog.data ?? []).filter((e) => e.category === "free");
 
   return (
     <div className="space-y-6">
@@ -59,7 +77,7 @@ export function ProvidersPage() {
         <div>
           <h1 className="text-lg font-semibold tracking-tight">Providers</h1>
           <p className="text-sm text-[var(--muted)]">
-            Connect an upstream once, then enable the models you want exposed. Multiple connections per provider rotate round-robin.
+            OAuth providers log in with your subscription account. Free tier and API key providers connect with a key. Multiple connections rotate round-robin.
           </p>
         </div>
         <Button variant="secondary" onClick={() => setCustomOpen(true)}>
@@ -67,14 +85,15 @@ export function ProvidersPage() {
         </Button>
       </header>
 
-      {/* catalog grid */}
+      {/* OAuth section */}
       <section>
-        <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--faint)]">Catalog</h2>
-        {catalog.isLoading ? (
-          <div className="skeleton h-40 rounded-[var(--radius)]" />
-        ) : (
-          <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-4">
-            {(catalog.data ?? []).map((e) => (
+        <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--faint)]">OAuth providers</h2>
+        <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-4">
+          {(oauthCatalog.data ?? []).map((e) => {
+            const conns = (providers.data ?? []).filter(
+              (p) => p.catalog === e.id || p.slug.startsWith(e.id)
+            );
+            return (
               <div
                 key={e.id}
                 className="flex flex-col justify-between gap-2 rounded-[var(--radius)] border border-[var(--panel-edge)] bg-[var(--panel)] p-3"
@@ -82,30 +101,42 @@ export function ProvidersPage() {
                 <div>
                   <div className="flex items-center justify-between gap-2">
                     <span className="truncate text-sm font-medium">{e.name}</span>
-                    <Badge tone={e.connected_count > 0 ? "ok" : "muted"}>
-                      {e.connected_count > 0 ? `${e.connected_count} connected` : "no connection"}
+                    <Badge tone={conns.length > 0 ? "ok" : "muted"}>
+                      {conns.length > 0 ? `${conns.length} connected` : "no connection"}
                     </Badge>
                   </div>
-                  <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-[var(--faint)]">
-                    <span>{CATEGORY_LABEL[e.category] ?? e.category}</span>
-                    <span>·</span>
-                    <span>{e.protocol}</span>
-                    {e.website && (
-                      <>
-                        <span>·</span>
-                        <a href={e.website} target="_blank" rel="noreferrer" className="link">
-                          get key
-                        </a>
-                      </>
-                    )}
-                  </div>
+                  {conns.length > 0 && (
+                    <div className="mt-1 space-y-0.5">
+                      {conns.slice(0, 3).map((p) => (
+                        <div key={p.id} className="mono truncate text-[10px] text-[var(--faint)]">
+                          · {p.email || p.name}
+                        </div>
+                      ))}
+                      {conns.length > 3 && (
+                        <div className="text-[10px] text-[var(--faint)]">+{conns.length - 3} more</div>
+                      )}
+                    </div>
+                  )}
                   {e.notice && <p className="mt-1 line-clamp-2 text-[11px] leading-snug text-[var(--muted)]">{e.notice}</p>}
                 </div>
-                <Button onClick={() => setConnectFor(e)}>+ Connect</Button>
+                <Button onClick={() => setOauthFor(e)}>+ Connect account</Button>
               </div>
-            ))}
-          </div>
-        )}
+            );
+          })}
+          {oauthCatalog.isLoading && <div className="skeleton h-28" />}
+        </div>
+      </section>
+
+      {/* Free tier section */}
+      <section>
+        <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--faint)]">Free tier providers</h2>
+        <CatalogGrid rows={freeTierProviders} onConnect={setConnectFor} />
+      </section>
+
+      {/* API key section */}
+      <section>
+        <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--faint)]">API key providers</h2>
+        <CatalogGrid rows={apiKeyProviders} onConnect={setConnectFor} />
       </section>
 
       {/* connections */}
@@ -122,7 +153,7 @@ export function ProvidersPage() {
                 <tr>
                   <th className="px-3 py-2 font-medium">Connection</th>
                   <th className="px-3 py-2 font-medium">Slug</th>
-                  <th className="px-3 py-2 font-medium">Key</th>
+                  <th className="px-3 py-2 font-medium">Auth</th>
                   <th className="px-3 py-2 font-medium">Models</th>
                   <th className="px-3 py-2 font-medium text-right">Actions</th>
                 </tr>
@@ -133,7 +164,9 @@ export function ProvidersPage() {
                     <td className="px-3 py-2">{p.name}</td>
                     <td className="mono px-3 py-2 text-xs text-[var(--muted)]">{p.slug}</td>
                     <td className="px-3 py-2">
-                      <Badge tone={p.has_key ? "ok" : "warn"}>{p.has_key ? "set" : "missing"}</Badge>
+                      <Badge tone={p.auth_type === "oauth" ? "accent" : p.has_key ? "ok" : "warn"}>
+                        {p.auth_type === "oauth" ? "oauth" : p.has_key ? "api key" : "missing"}
+                      </Badge>
                     </td>
                     <td className="px-3 py-2 tabular-nums">{p.model_count}</td>
                     <td className="px-3 py-2 text-right">
@@ -170,8 +203,230 @@ export function ProvidersPage() {
           }}
         />
       )}
+      {oauthFor && (
+        <OAuthModal
+          entry={oauthFor}
+          onClose={() => setOauthFor(null)}
+          onSaved={() => {
+            setOauthFor(null);
+            qc.invalidateQueries({ queryKey: ["providers"] });
+          }}
+        />
+      )}
       {openConn && <ModelsDrawer conn={openConn} onClose={() => setOpenConn(null)} />}
     </div>
+  );
+}
+
+// ---- catalog grid used by free-tier & api-key sections ----------------------
+
+function CatalogGrid({
+  rows,
+  onConnect,
+}: {
+  rows: CatalogRow[];
+  onConnect: (e: CatalogRow) => void;
+}) {
+  return (
+    <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-4">
+      {rows.map((e) => (
+        <div
+          key={e.id}
+          className="flex flex-col justify-between gap-2 rounded-[var(--radius)] border border-[var(--panel-edge)] bg-[var(--panel)] p-3"
+        >
+          <div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="truncate text-sm font-medium">{e.name}</span>
+              <Badge tone={e.connected_count > 0 ? "ok" : "muted"}>
+                {e.connected_count > 0 ? `${e.connected_count} connected` : "no connection"}
+              </Badge>
+            </div>
+            <div className="mt-0.5 text-[11px] text-[var(--faint)]">
+              <span>{e.protocol}</span>
+              {e.website && (
+                <>
+                  {" · "}
+                  <a href={e.website} target="_blank" rel="noreferrer" className="link">
+                    get key
+                  </a>
+                </>
+              )}
+            </div>
+            {e.notice && <p className="mt-1 line-clamp-2 text-[11px] leading-snug text-[var(--muted)]">{e.notice}</p>}
+          </div>
+          <Button onClick={() => onConnect(e)}>+ Connect</Button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---- OAuth connect modal: interactive PKCE + bulk import ---------------------
+
+function OAuthModal({
+  entry,
+  onClose,
+  onSaved,
+}: {
+  entry: OAuthCatalogRow;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { toast } = useOverlays();
+  const [tab, setTab] = useState<"interactive" | "bulk">("interactive");
+  const [authorizeUrl, setAuthorizeUrl] = useState<string | null>(null);
+  const [callbackUrl, setCallbackUrl] = useState("");
+  const [bulkJson, setBulkJson] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+
+  // step 1: get the authorize URL
+  const startFlow = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(`/api/admin/oauth/${entry.id}/start`, { method: "POST" });
+      if (!r.ok) throw new Error(((await r.json()) as ApiError).error?.message ?? `HTTP ${r.status}`);
+      return r.json() as Promise<{ authorize_url: string }>;
+    },
+    onSuccess: (d) => setAuthorizeUrl(d.authorize_url),
+    onError: (e) => setErr((e as Error).message),
+  });
+
+  // step 2: paste callback -> finish
+  const finishFlow = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(`/api/admin/oauth/${entry.id}/finish`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callback_url: callbackUrl }),
+      });
+      if (!r.ok) throw new Error(((await r.json()) as ApiError).error?.message ?? `HTTP ${r.status}`);
+      return r.json() as Promise<{ email?: string; slug?: string }>;
+    },
+    onSuccess: (d) => {
+      toast(`Connected${d.email ? `: ${d.email}` : ""}`, "ok");
+      onSaved();
+    },
+    onError: (e) => setErr((e as Error).message),
+  });
+
+  const bulkImport = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(`/api/admin/oauth/${entry.id}/import`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ json: bulkJson }),
+      });
+      if (!r.ok) throw new Error(((await r.json()) as ApiError).error?.message ?? `HTTP ${r.status}`);
+      return r.json() as Promise<{ created: number }>;
+    },
+    onSuccess: (d) => {
+      toast(`${d.created} account(s) imported`, "ok");
+      onSaved();
+    },
+    onError: (e) => setErr((e as Error).message),
+  });
+
+  return (
+    <Modal title={`Connect ${entry.name}`} onClose={onClose} wide>
+      <div className="space-y-4">
+        {/* tabs */}
+        <div className="flex rounded-full border border-[var(--panel-edge)] p-0.5 text-xs font-medium">
+          <button
+            className={`flex-1 rounded-full px-3 py-1.5 transition-colors ${
+              tab === "interactive" ? "bg-[var(--accent)] text-white" : "text-[var(--muted)] hover:bg-[var(--inset)]"
+            }`}
+            onClick={() => setTab("interactive")}
+          >
+            Interactive login
+          </button>
+          {entry.supports_bulk && (
+            <button
+              className={`flex-1 rounded-full px-3 py-1.5 transition-colors ${
+                tab === "bulk" ? "bg-[var(--accent)] text-white" : "text-[var(--muted)] hover:bg-[var(--inset)]"
+              }`}
+              onClick={() => setTab("bulk")}
+            >
+              Bulk import tokens
+            </button>
+          )}
+        </div>
+
+        {tab === "interactive" ? (
+          <div className="space-y-3">
+            {!authorizeUrl ? (
+              <>
+                <p className="text-sm leading-relaxed text-[var(--muted)]">
+                  Arteri generates a PKCE login link using the same OAuth client as {entry.name}'s CLI. Open it, sign in,
+                  then paste the redirected URL back here.
+                </p>
+                <ErrorText msg={err} />
+                <div className="flex justify-end gap-2">
+                  <Button variant="ghost" onClick={onClose}>
+                    Cancel
+                  </Button>
+                  <Button disabled={startFlow.isPending} onClick={() => startFlow.mutate()}>
+                    {startFlow.isPending ? "Generating..." : "Generate login link"}
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <>
+                <Field label="Step 1 — open this link and sign in">
+                  <div className="flex gap-2">
+                    <TextInput readOnly value={authorizeUrl} onFocus={(e) => e.currentTarget.select()} />
+                    <CopyBtn text={authorizeUrl} label="copy" />
+                  </div>
+                </Field>
+                <Field label="Step 2 — paste the callback URL you were redirected to">
+                  <TextInput
+                    value={callbackUrl}
+                    onChange={(e) => setCallbackUrl(e.target.value)}
+                    placeholder="http://localhost:8787/api/admin/oauth/callback?code=...&state=..."
+                  />
+                </Field>
+                <ErrorText msg={err} />
+                <div className="flex justify-end gap-2">
+                  <Button variant="ghost" onClick={onClose}>
+                    Cancel
+                  </Button>
+                  <Button disabled={!callbackUrl || finishFlow.isPending} onClick={() => finishFlow.mutate()}>
+                    {finishFlow.isPending ? "Connecting..." : "Connect"}
+                  </Button>
+                </div>
+              </>
+            )}
+          </div>
+        ) : (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              bulkImport.mutate();
+            }}
+            className="space-y-3"
+          >
+            <Field
+              label="Accounts JSON"
+              hint="Paste ~/.codex/auth.json content — a single object or an array with accessToken / refreshToken / email."
+            >
+              <textarea
+                value={bulkJson}
+                onChange={(e) => setBulkJson(e.target.value)}
+                placeholder={`[\n  {\n    "accessToken": "...",\n    "refreshToken": "...",\n    "email": "user@example.com"\n  }\n]`}
+                className="input mono h-48 resize-y text-xs"
+              />
+            </Field>
+            <ErrorText msg={err} />
+            <div className="flex justify-end gap-2 pt-1">
+              <Button type="button" variant="ghost" onClick={onClose}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={!bulkJson.trim() || bulkImport.isPending}>
+                {bulkImport.isPending ? "Importing..." : "Import All"}
+              </Button>
+            </div>
+          </form>
+        )}
+      </div>
+    </Modal>
   );
 }
 
@@ -274,28 +529,28 @@ function CustomModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
   );
 }
 
-function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
-  return (
-    <label className="block space-y-1">
-      <span className="text-xs font-medium text-[var(--muted)]">{label}</span>
-      {children}
-      {hint && <span className="block text-[11px] leading-snug text-[var(--faint)]">{hint}</span>}
-    </label>
-  );
-}
-
 function DeleteConnection({ id, onDone }: { id: number; onDone: () => void }) {
+  const { confirm, toast } = useOverlays();
   const del = useMutation({
     mutationFn: async () => {
       await api(`/api/admin/providers/${id}`, { method: "DELETE" });
     },
-    onSuccess: onDone,
+    onSuccess: () => {
+      toast("Connection deleted");
+      onDone();
+    },
   });
   return (
     <button
       className="text-red-600 hover:underline"
-      onClick={() => {
-        if (confirm("Delete this connection and its cached models?")) del.mutate();
+      onClick={async () => {
+        if (
+          await confirm({
+            title: "Delete connection?",
+            body: "Its cached model list and enabled models are removed too. Combos referencing them stop resolving.",
+          })
+        )
+          del.mutate();
       }}
     >
       Delete

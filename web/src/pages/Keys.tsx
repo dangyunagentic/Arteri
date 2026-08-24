@@ -2,6 +2,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api } from "../api";
+import { useOverlays } from "../toast";
 import { Badge, Button, CopyBtn, ErrorText, Field, Modal, TextInput, Toggle } from "../ui";
 import { fmt } from "./Overview";
 
@@ -50,6 +51,7 @@ function Meter({ used, limit }: { used: number; limit: number | null }) {
 
 export default function Keys() {
   const qc = useQueryClient();
+  const { confirm, toast } = useOverlays();
   const { data: keys, refetch } = useQuery({ queryKey: ["keys"], queryFn: () => api<KeyRow[]>("/api/admin/keys") });
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<KeyRow | null>(null);
@@ -102,8 +104,9 @@ export default function Keys() {
                 variant="danger"
                 className="ml-auto px-2 py-1 text-xs"
                 onClick={async () => {
-                  if (!confirm(`Delete '${k.label || "key #" + k.id}'?`)) return;
+                  if (!(await confirm({ title: "Delete API key?", body: `'${k.label || "key #" + k.id}' stops working immediately. Usage history stays.` }))) return;
                   await api(`/api/admin/keys/${k.id}`, { method: "DELETE" });
+                  toast("API key deleted");
                   qc.invalidateQueries({ queryKey: ["keys"] });
                 }}
               >
@@ -150,13 +153,14 @@ function mask(t: string) {
 
 function RotateBtn({ id, onDone }: { id: number; onDone: () => void }) {
   const [tok, setTok] = useState<string | null>(null);
+  const { confirm } = useOverlays();
   return (
     <>
       <Button
         variant="ghost"
         className="px-2 py-1 text-xs"
         onClick={async () => {
-          if (!confirm("Rotate token? The old key stops working immediately.")) return;
+          if (!(await confirm({ title: "Rotate token?", body: "The old key stops working immediately." }))) return;
           const r = await api<{ token: string }>(`/api/admin/keys/${id}/rotate`, { method: "POST" });
           setTok(r.token);
           onDone();

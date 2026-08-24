@@ -2,6 +2,7 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api, type ApiError } from "../api";
+import { useOverlays } from "../toast";
 import { Badge, Button, ErrorText, Modal, TextInput } from "../ui";
 
 interface ComboModel {
@@ -34,6 +35,7 @@ const STRATEGY_HELP: Record<Combo["strategy"], string> = {
 
 export function CombosPage() {
   const qc = useQueryClient();
+  const { confirm, toast } = useOverlays();
   const combos = useQuery({ queryKey: ["combos"], queryFn: () => api<Combo[]>("/api/admin/combos") });
   const providers = useQuery({ queryKey: ["providers"], queryFn: () => api<ProviderRow[]>("/api/admin/providers") });
   const [editing, setEditing] = useState<Combo | "new" | null>(null);
@@ -74,8 +76,9 @@ export function CombosPage() {
                     variant="ghost"
                     className="text-red-600"
                     onClick={async () => {
-                      if (!confirm(`Delete combo ${c.public_id}?`)) return;
+                      if (!(await confirm({ title: "Delete combo?", body: `${c.public_id} stops resolving immediately for every client using it.` }))) return;
                       await api(`/api/admin/combos/${c.id}`, { method: "DELETE" });
+                      toast(`Combo ${c.public_id} deleted`);
                       qc.invalidateQueries({ queryKey: ["combos"] });
                     }}
                   >

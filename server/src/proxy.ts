@@ -6,6 +6,9 @@ import { BadRequest, parseJson, bool } from "./validate";
 import { buildUpstreamThinking, stripClientThinking } from "./thinking";
 import { applySavers } from "./savers-apply";
 import { getSaversConfig } from "./savers-config";
+import { validAccessToken } from "./oauth";
+import { catalogAny } from "./catalog";
+import { chatToResponses, responsesUsageOf } from "./wire";
 
 export interface KeyRow {
   id: number;
@@ -31,6 +34,9 @@ export interface ModelRow {
   api_key: string;
   protocol: "openai" | "anthropic";
   extra_headers: string;
+  catalog?: string;
+  auth_type?: "apikey" | "oauth";
+  oauth_tokens?: string;
 }
 
 export function bearer(c: Context): string | null {
@@ -108,7 +114,7 @@ export function resolve(publicId: string): Resolved {
   }
   const row = db
     .query(
-      `SELECT m.*, p.base_url, p.api_key, p.protocol, p.extra_headers
+      `SELECT m.*, p.base_url, p.api_key, p.protocol, p.extra_headers, p.catalog, p.auth_type, p.tokens AS oauth_tokens
        FROM models m JOIN providers p ON p.id = m.provider_id
        WHERE m.public_id = ? AND m.enabled = 1`
     )
@@ -144,7 +150,7 @@ export function targetModel(target: string): ModelRow {
   if (!upstream) throw new HttpError(500, "bad_combo_target", `combo target '${target}' malformed`);
   const row = db
     .query(
-      `SELECT m.*, p.base_url, p.api_key, p.protocol, p.extra_headers
+      `SELECT m.*, p.base_url, p.api_key, p.protocol, p.extra_headers, p.catalog, p.auth_type, p.tokens AS oauth_tokens
        FROM models m JOIN providers p ON p.id = m.provider_id
        WHERE p.slug = ? AND m.upstream_id = ? AND m.enabled = 1`
     )
@@ -158,7 +164,7 @@ export function targetModel(target: string): ModelRow {
 export function providerPool(slug: string): ModelRow[] {
   return db
     .query(
-      `SELECT m.*, p.base_url, p.api_key, p.protocol, p.extra_headers
+      `SELECT m.*, p.base_url, p.api_key, p.protocol, p.extra_headers, p.catalog, p.auth_type, p.tokens AS oauth_tokens
        FROM models m JOIN providers p ON p.id = m.provider_id
        WHERE p.slug = ? AND m.enabled = 1`
     )
@@ -169,7 +175,7 @@ export function providerPool(slug: string): ModelRow[] {
 export function pickConnection(slug: string, wantUpstream: string): ModelRow {
   const pool = db
     .query(
-      `SELECT m.*, p.base_url, p.api_key, p.protocol, p.extra_headers
+      `SELECT m.*, p.base_url, p.api_key, p.protocol, p.extra_headers, p.catalog, p.auth_type, p.tokens AS oauth_tokens
        FROM models m JOIN providers p ON p.id = m.provider_id
        WHERE p.slug = ? AND m.upstream_id = ? AND m.enabled = 1`
     )
@@ -250,7 +256,11 @@ function baseOf(url: string): string {
 }
 
 /** Build upstream Request for a model row. */
-function upstreamRequest(m: ModelRow, body: Record<string, any>, stream: boolean): Request {
+async function upstreamRequest(m: ModelRow, body: Record<string, any>, stream: boolean): Promise<Request> {
+  const entry = m.catalog && m.catalog !== "custom" ? catalogAny(m.catalog) : undefined;
+  const wire = entry?.wire ?? "chat";
+  const isOAuth = m.auth_type === "oauth";
+
   const t = buildUpstreamThinking(body, m, m.protocol);
   stripClientThinking(body);
   if (t.value) {
@@ -263,10 +273,47 @@ function upstreamRequest(m: ModelRow, body: Record<string, any>, stream: boolean
       body.reasoning_effort = (t.value as any).effort ?? body.reasoning_effort;
     }
   }
-  body.model = m.upstream_id;
-  body.stream = stream;
 
   const headers: Record<string, string> = { "content-type": "application/json" };
+  let url: string;
+
+  if (isOAuth && entry) {
+    // oauth subscription account — bearer token from stored/refreshed blob
+    const tok = await validAccessToken({
+      id: m.provider_id,
+      catalog: m.catalog ?? "",
+      tokens: m.oauth_tokens ?? "",
+    });
+    if ("error" in tok) throw new HttpError(401, "oauth_token", `oauth token problem: ${tok.error}`);
+    headers["authorization"] = `Bearer ${tok.token}`;
+    for (const [k, v] of Object.entries(entry.extraHeaders ?? {})) if (typeof v === "string") headers[k] = v;
+    if (entry.id === "claude-code") {
+      delete headers["x-api-key"];
+      // cloak as Claude Code CLI
+      headers["user-agent"] = "claude-cli/2.1.92 (external, sdk-cli)";
+      headers["x-app"] = "cli";
+      headers["anthropic-beta"] =
+        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05";
+      headers["anthropic-version"] = "2023-06-01";
+    }
+
+    if (wire === "responses") {
+      // chat -> OpenAI Responses API; codex requires streaming
+      url = `${baseOf(m.base_url)}/responses`;
+      return new Request(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(chatToResponses(body, m.upstream_id)),
+        signal: AbortSignal.timeout(600_000),
+      });
+    }
+    url = `${baseOf(m.base_url)}/messages`;
+    body.model = m.upstream_id;
+    body.stream = stream;
+    return new Request(url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(600_000) });
+  }
+
+  // plain api-key path (chat wire or claude api)
   if (m.protocol === "anthropic") {
     headers["x-api-key"] = m.api_key;
     headers["anthropic-version"] = "2023-06-01";
@@ -281,6 +328,8 @@ function upstreamRequest(m: ModelRow, body: Record<string, any>, stream: boolean
   } catch {}
 
   const path = m.protocol === "anthropic" ? "/messages" : "/chat/completions";
+  body.model = m.upstream_id;
+  body.stream = stream;
   return new Request(baseOf(m.base_url) + path, {
     method: "POST",
     headers,
@@ -342,9 +391,9 @@ async function tryUpstream(
   body: Record<string, any>,
   stream: boolean
 ): Promise<{ ok: boolean; status: number; res: Response }> {
-  const req = upstreamRequest(m, body, stream);
+  const req = await upstreamRequest(m, body, stream);
   let res: Response;
-  try {
+    try {
     res = await fetch(req);
   } catch (e: any) {
     throw new HttpError(502, "upstream_unreachable", `provider unreachable: ${e?.message ?? e}`);

@@ -3,20 +3,40 @@
 // and (optionally) read quota/usage from a usage API.
 export type Protocol = "openai" | "anthropic";
 
+export interface OAuthCfg {
+  clientId?: string;
+  clientSecretEnv?: string; // gemini-style public client secret
+  authorizeUrl: string;
+  tokenUrl: string;
+  scopes: string[];
+  codeChallengeMethod?: "S256" | "plain";
+  extraParams?: Record<string, string>;
+  refreshEncoding?: "form" | "json";
+}
+
 export interface CatalogEntry {
   id: string;
   name: string;
-  protocol: Protocol;                       // wire format
-  baseUrl: string;                          // includes version path where needed
-  category: "key" | "free" | "cloud";
-  auth?: "bearer" | "x-api-key";            // default bearer
+  protocol: Protocol;
+  wire?: "chat" | "responses" | "claude";    // upstream API shape (default chat)
+  baseUrl: string;                            // includes version path where needed
+  category: "key" | "free" | "cloud" | "oauth";
+  auth?: "bearer" | "x-api-key";              // default bearer
   extraHeaders?: Record<string, string>;
-  modelsUrl?: string;                       // GET -> { data: [{id}] } or [{id}]
-  modelsAuth?: boolean;                     // send auth on models fetch
-  modelsPicker?: "openai" | "openrouter" | "opencode" | "gemini" | "together" | "mistral";
-  usageUrl?: string;                        // quota endpoint template
+  modelsUrl?: string;                         // GET -> { data: [{id}] } or [{id}]
+  modelsAuth?: boolean;                       // send auth on models fetch
+  modelsPicker?:
+    | "openai"
+    | "openrouter"
+    | "opencode"
+    | "gemini"
+    | "together"
+    | "mistral";
+  staticModels?: { id: string; name: string }[]; // oauth providers ship a fixed list
+  usageUrl?: string;                          // quota endpoint template
   website?: string;
   notice?: string;
+  oauth?: OAuthCfg;
 }
 
 const CHAT = "/chat/completions";
@@ -176,4 +196,79 @@ export const CATALOG: CatalogEntry[] = [
 
 export function catalogGet(id: string): CatalogEntry | undefined {
   return CATALOG.find((c) => c.id === id);
+}
+
+// ---- OAuth providers (subscription accounts) --------------------------------
+
+const CODEX_MODELS = [
+  { id: "gpt-5.2", name: "GPT-5.2" },
+  { id: "gpt-5.2-codex", name: "GPT-5.2 Codex" },
+  { id: "gpt-5.1-codex-max", name: "GPT-5.1 Codex Max" },
+  { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini" },
+  { id: "gpt-5", name: "GPT-5" },
+  { id: "codex-mini-latest", name: "Codex Mini" },
+];
+
+const CLAUDE_MODELS = [
+  { id: "claude-opus-4-6", name: "Claude Opus 4.6" },
+  { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
+  { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5" },
+];
+
+export const OAUTH_CATALOG: CatalogEntry[] = [
+  {
+    id: "openai-codex",
+    name: "OpenAI Codex",
+    protocol: "openai",
+    wire: "responses",
+    baseUrl: "https://chatgpt.com/backend-api/codex",
+    category: "oauth",
+    extraHeaders: { originator: "codex_cli_rs", "User-Agent": "codex_cli_rs/0.136.0" },
+    staticModels: CODEX_MODELS,
+    usageUrl: "https://chatgpt.com/backend-api/wham/usage",
+    website: "https://chatgpt.com/codex",
+    notice:
+      "Uses your ChatGPT Plus/Pro subscription via the Codex CLI OAuth app. Interactive login or paste token JSON from ~/.codex/auth.json.",
+    oauth: {
+      clientId: "app_EMoamEEZ73f0CkXaXp7hrann",
+      authorizeUrl: "https://auth.openai.com/oauth/authorize",
+      tokenUrl: "https://auth.openai.com/oauth/token",
+      scopes: ["openid", "profile", "email", "offline_access"],
+      codeChallengeMethod: "S256",
+      extraParams: {
+        id_token_add_organizations: "true",
+        codex_cli_simplified_flow: "true",
+        originator: "codex_cli_rs",
+      },
+      refreshEncoding: "form",
+    },
+  },
+  {
+    id: "claude-code",
+    name: "Claude Code",
+    protocol: "anthropic",
+    wire: "claude",
+    baseUrl: "https://api.anthropic.com/v1",
+    category: "oauth",
+    auth: "x-api-key",
+    staticModels: CLAUDE_MODELS,
+    usageUrl: "https://api.anthropic.com/api/oauth/usage",
+    website: "https://claude.ai/settings/billing",
+    notice:
+      "Uses your Claude Pro/Max subscription via the Claude Code OAuth client. Bearer-token auth with tool cloaking, like the CLI.",
+    oauth: {
+      clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+      authorizeUrl: "https://claude.ai/oauth/authorize",
+      tokenUrl: "https://api.anthropic.com/v1/oauth/token",
+      scopes: ["org:create_api_key", "user:profile", "user:inference"],
+      codeChallengeMethod: "S256",
+      refreshEncoding: "json",
+    },
+  },
+];
+
+// merged view for lookups
+export const FULL_CATALOG: CatalogEntry[] = [...CATALOG, ...OAUTH_CATALOG];
+export function catalogAny(id: string): CatalogEntry | undefined {
+  return FULL_CATALOG.find((c) => c.id === id);
 }
