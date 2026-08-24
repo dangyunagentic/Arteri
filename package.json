@@ -1,0 +1,18 @@
+{
+  "name": "arteri",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "bun run --filter '*' dev",
+    "dev:server": "bun run --cwd server dev",
+    "dev:web": "bun run --cwd web dev",
+    "build": "bun run --cwd web build",
+    "start": "bun run server/src/index.ts",
+    "check": "bun run --filter '*' check",
+    "test": "bun run server/test/e2e.ts"
+  }
+}
